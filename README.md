@@ -16,6 +16,10 @@
 - Python 3.11 或更高版本
 - 运行时仅使用 Python 标准库和 SQLite
 
+## 分析任务租约栅栏
+
+`turbine_health` 的分析队列在提交边界核对五项栅栏：当前领取者、租约代次（`lease_epoch`）、有效期限、任务修订号和测点输入摘要（`input_sha256`，领取时快照登记、提交时重算比对）。任一项落后都返回 `lease_conflict`（HTTP 409，错误体含逐项失配明细），且不产生分析记录、状态变更或审计残片。接管会递增尝试序号与租约代次并留下 `analysis_job.lease_expired` / `analysis_job.taken_over` 审计事件；同一持有者以相同代次和摘要重复提交可取回原响应。`GET /jobs/{id}/history`（审计角色）呈现各次领取、失效、接管、失败与最终落库及其输入摘要。
+
 ## 测试
 
 ```bash

@@ -41,16 +41,19 @@ def run(workspace: Path) -> dict[str, object]:
             job = service.claim_job("worker-1", lease_seconds=60)
             if job is None:
                 raise RuntimeError("未能领取分析任务")
-            analysis = service.complete_job("worker-1", job["job_id"], "stat-1")
+            analysis = service.complete_job(
+                "worker-1", job["job_id"], "stat-1", job["lease_epoch"], job["input_sha256"]
+            )
             decision_value = "approved" if analysis["result"]["conclusion"] == "pass" else "rejected"
             service.decide(
                 "approver-1", "batch-demo", analysis["analysis_id"], decision_value, "离线验收决定"
             )
             report = service.report("auditor-1", "batch-demo")
+            history = service.job_history("auditor-1", job["job_id"])
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
     return {
         "status": "ok",
@@ -61,6 +64,7 @@ def run(workspace: Path) -> dict[str, object]:
         "conclusion": analysis["result"]["conclusion"],
         "decision": report["decision"]["decision"],
         "event_count": len(report["events"]),
+        "job_lease_events": len(history["events"]),
         "schema": schema,
     }
 

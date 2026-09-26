@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -114,9 +114,11 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     batch_revision INTEGER NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'succeeded', 'failed')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK (lease_epoch >= 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT,
     lease_expires_at TEXT,
+    input_sha256 TEXT CHECK (input_sha256 IS NULL OR length(input_sha256) = 64),
     last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -166,6 +168,17 @@ REQUIRED_TABLES = frozenset({
 })
 
 
+# 版本间迁移：键为目标版本，值为升到该版本需要执行的语句。
+MIGRATIONS = {
+    3: (
+        "ALTER TABLE analysis_jobs ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0 "
+        "CHECK (lease_epoch >= 0)",
+        "ALTER TABLE analysis_jobs ADD COLUMN input_sha256 TEXT "
+        "CHECK (input_sha256 IS NULL OR length(input_sha256) = 64)",
+    ),
+}
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     """打开连接并启用严格的事务与外键设置。"""
 
@@ -190,11 +203,34 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _stored_version(connection: sqlite3.Connection) -> int:
+    """读取已登记的版本；缺失时按 analysis_jobs 的实际列推断。"""
+
+    row = connection.execute(
+        "SELECT value FROM schema_meta WHERE key='schema_version'"
+    ).fetchone()
+    if row is not None:
+        return int(row["value"] if isinstance(row, sqlite3.Row) else row[0])
+    columns = {
+        record[1] for record in connection.execute("PRAGMA table_info(analysis_jobs)").fetchall()
+    }
+    return SCHEMA_VERSION if "lease_epoch" in columns else 2
+
+
 def initialize(connection: sqlite3.Connection) -> None:
-    """初始化基础资料表，重复执行不改变已有数据。"""
+    """初始化基础资料表并迁移旧库，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
     with transaction(connection, immediate=True):
+        current = _stored_version(connection)
+        if current > SCHEMA_VERSION:
+            raise RuntimeError(f"数据库结构版本 {current} 高于程序支持的 {SCHEMA_VERSION}")
+        for target in range(current + 1, SCHEMA_VERSION + 1):
+            statements = MIGRATIONS.get(target)
+            if statements is None:
+                raise RuntimeError(f"缺少到结构版本 {target} 的迁移")
+            for statement in statements:
+                connection.execute(statement)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
