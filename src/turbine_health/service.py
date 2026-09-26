@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 from .analysis import ALGORITHM_VERSION, analyze
 from .clock import SystemClock, isoformat
 from .contracts import Observation, Protocol, ValidationError
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .errors import Conflict, Forbidden, InvalidState, LeaseConflict, NotFound, ValidationFailed
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
 
@@ -362,27 +362,91 @@ class TrialService:
             self._audit("batch", batch_id, "batch.sealed", actor_id, {"revision": new_revision})
         return self.get_batch(batch_id)
 
+    def _job_snapshot(
+        self, batch: sqlite3.Row
+    ) -> tuple[Protocol, str, tuple[Observation, ...], str]:
+        """汇总任务批次当前的测点输入快照与摘要。"""
+
+        protocol, protocol_digest = self._protocol(batch["protocol_id"], batch["protocol_version"])
+        observations = self._analysis_observations(batch["batch_id"], protocol)
+        snapshot_rows = [
+            {
+                "source_batch": item.source_batch,
+                "source_row": item.source_row,
+                "stratum": item.stratum_key,
+                "metrics": {key: format(value, "f") for key, value in item.metrics.items()},
+                "excluded_reason": item.excluded_reason,
+            }
+            for item in observations
+        ]
+        return protocol, protocol_digest, observations, content_digest(snapshot_rows)
+
     def claim_job(self, worker_id: str, lease_seconds: int = 60) -> dict[str, Any] | None:
+        if not worker_id.strip():
+            raise ValidationFailed("工作进程编号不能为空")
         if lease_seconds <= 0:
             raise ValidationFailed("租约时长必须大于零")
         now = self._now()
         expires = isoformat(self.clock.now() + timedelta(seconds=lease_seconds))
         with transaction(self.connection, immediate=True):
             row = self.connection.execute(
-                "SELECT job_id FROM analysis_jobs WHERE "
+                "SELECT * FROM analysis_jobs WHERE "
                 "(state='queued' AND available_at<=?) OR (state='leased' AND lease_expires_at<=?) "
                 "ORDER BY available_at,job_id LIMIT 1",
                 (now, now),
             ).fetchone()
             if row is None:
                 return None
-            self.connection.execute(
-                "UPDATE analysis_jobs SET state='leased',attempts=attempts+1,lease_owner=?,lease_expires_at=?,updated_at=? "
-                "WHERE job_id=?",
-                (worker_id, expires, now, row["job_id"]),
+            batch = self.connection.execute(
+                "SELECT * FROM batches WHERE batch_id=?", (row["batch_id"],)
+            ).fetchone()
+            _, _, _, input_digest = self._job_snapshot(batch)
+            generation = row["lease_generation"] + 1
+            attempt = row["attempts"] + 1
+            cursor = self.connection.execute(
+                "UPDATE analysis_jobs SET state='leased',attempts=?,lease_generation=?,lease_owner=?,"
+                "lease_expires_at=?,claim_input_sha256=?,completed_by=NULL,completed_generation=NULL,"
+                "completed_analysis_id=NULL,completion_json=NULL,updated_at=? "
+                "WHERE job_id=? AND ((state='queued' AND available_at<=?) OR "
+                "(state='leased' AND lease_expires_at<=?)) AND lease_generation=?",
+                (
+                    attempt, generation, worker_id, expires, input_digest, now,
+                    row["job_id"], now, now, row["lease_generation"],
+                ),
             )
-            claimed = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (row["job_id"],)).fetchone()
-        return dict(claimed)
+            if cursor.rowcount != 1:
+                raise Conflict("分析任务已被其他工作进程领取")
+            payload: dict[str, Any] = {
+                "job_id": row["job_id"],
+                "batch_id": row["batch_id"],
+                "batch_revision": row["batch_revision"],
+                "worker_id": worker_id,
+                "attempt": attempt,
+                "lease_generation": generation,
+                "lease_expires_at": expires,
+                "input_sha256": input_digest,
+            }
+            if row["state"] == "leased":
+                payload["took_over_from"] = {
+                    "worker_id": row["lease_owner"],
+                    "lease_generation": row["lease_generation"],
+                    "lease_expires_at": row["lease_expires_at"],
+                }
+                self._audit(
+                    "analysis_job",
+                    str(row["job_id"]),
+                    "analysis_job.taken_over",
+                    worker_id,
+                    payload,
+                )
+            else:
+                self._audit("analysis_job", str(row["job_id"]), "analysis_job.claimed", worker_id, payload)
+            claimed = self.connection.execute(
+                "SELECT * FROM analysis_jobs WHERE job_id=?", (row["job_id"],)
+            ).fetchone()
+        result = dict(claimed)
+        result["input_sha256"] = input_digest
+        return result
 
     def _analysis_observations(self, batch_id: str, protocol: Protocol) -> tuple[Observation, ...]:
         rows = self.connection.execute(
@@ -407,41 +471,105 @@ class TrialService:
             ))
         return tuple(items)
 
-    def complete_job(self, worker_id: str, job_id: int, statistician_id: str) -> dict[str, Any]:
-        self._require(statistician_id, "analysis.run")
-        job = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)).fetchone()
+    def _get_job(self, job_id: int) -> sqlite3.Row:
+        job = self.connection.execute(
+            "SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
         if job is None:
             raise NotFound("分析任务不存在")
-        if job["state"] != "leased" or job["lease_owner"] != worker_id:
-            raise InvalidState("任务未由当前工作进程持有")
-        if job["lease_expires_at"] <= self._now():
-            raise InvalidState("任务租约已经过期")
+        return job
+
+    @staticmethod
+    def _fence_violation(
+        job: sqlite3.Row, batch: sqlite3.Row, worker_id: str, lease_generation: int, now: str
+    ) -> str | None:
+        """逐项核对租约栅栏，返回第一项落后的原因。"""
+
+        if job["state"] != "leased":
+            return f"任务状态为 {job['state']}，不在租约持有状态"
+        if job["lease_owner"] != worker_id:
+            return f"当前领取者为 {job['lease_owner']}，提交者 {worker_id} 已落后"
+        if lease_generation != job["lease_generation"]:
+            return f"租约代次落后：当前 {job['lease_generation']}，提交 {lease_generation}"
+        if job["lease_expires_at"] is None or job["lease_expires_at"] <= now:
+            return f"租约已于 {job['lease_expires_at']} 过期"
+        if job["batch_revision"] != batch["revision"]:
+            return f"任务修订号落后：批次当前 {batch['revision']}，任务 {job['batch_revision']}"
+        return None
+
+    def _completion_replay(
+        self, job: sqlite3.Row, worker_id: str, lease_generation: int, input_digest: str
+    ) -> dict[str, Any]:
+        """同一持有者对同一代租约的重复提交：完全一致则取回原响应。"""
+
+        if job["completed_by"] != worker_id or job["completed_generation"] != lease_generation:
+            raise LeaseConflict(
+                f"任务 {job['job_id']} 已由 {job['completed_by']} 在第 "
+                f"{job['completed_generation']} 代租约完成，当前提交落后",
+                {"job_id": job["job_id"], "state": job["state"]},
+            )
+        stored = json.loads(job["completion_json"])
+        if stored["input_sha256"] != input_digest:
+            raise LeaseConflict(
+                f"测点输入摘要已变化：落库时为 {stored['input_sha256']}，当前为 {input_digest}，"
+                "无法按幂等重放取回原响应",
+                {"job_id": job["job_id"], "state": job["state"]},
+            )
+        return stored
+
+    def complete_job(
+        self, worker_id: str, job_id: int, statistician_id: str, lease_generation: int
+    ) -> dict[str, Any]:
+        self._require(statistician_id, "analysis.run")
+        job = self._get_job(job_id)
         batch = self.get_batch(job["batch_id"])
-        protocol, protocol_digest = self._protocol(batch["protocol_id"], batch["protocol_version"])
-        observations = self._analysis_observations(batch["batch_id"], protocol)
-        snapshot_rows = [
-            {
-                "source_batch": item.source_batch,
-                "source_row": item.source_row,
-                "stratum": item.stratum_key,
-                "metrics": {key: format(value, "f") for key, value in item.metrics.items()},
-                "excluded_reason": item.excluded_reason,
-            }
-            for item in observations
-        ]
-        input_digest = content_digest(snapshot_rows)
+        if job["state"] == "succeeded":
+            _, _, _, input_digest = self._job_snapshot(batch)
+            return self._completion_replay(job, worker_id, lease_generation, input_digest)
+        violation = self._fence_violation(job, batch, worker_id, lease_generation, self._now())
+        if violation is not None:
+            raise LeaseConflict(violation, {"job_id": job_id, "state": job["state"]})
+        protocol, protocol_digest, observations, input_digest = self._job_snapshot(batch)
         result = analyze(protocol, observations)
+        response = {
+            "job_id": job_id,
+            "analysis_id": None,
+            "input_sha256": input_digest,
+            "lease_generation": lease_generation,
+            "worker_id": worker_id,
+            "result": result,
+        }
         with transaction(self.connection, immediate=True):
+            current = self._get_job(job_id)
+            current_batch = self.get_batch(job["batch_id"])
+            if current["state"] == "succeeded":
+                return self._completion_replay(current, worker_id, lease_generation, input_digest)
+            violation = self._fence_violation(
+                current, current_batch, worker_id, lease_generation, self._now()
+            )
+            if violation is not None:
+                raise LeaseConflict(violation, {"job_id": job_id, "state": current["state"]})
+            if current["claim_input_sha256"] is None:
+                raise LeaseConflict(
+                    "任务缺少领取时的测点输入摘要，请重新领取后再提交",
+                    {"job_id": job_id, "state": current["state"]},
+                )
+            if current["claim_input_sha256"] != input_digest:
+                raise LeaseConflict(
+                    "测点输入摘要已变化：领取时为 "
+                    f"{current['claim_input_sha256']}，提交时为 {input_digest}",
+                    {"job_id": job_id, "state": current["state"]},
+                )
             existing = self.connection.execute(
                 "SELECT analysis_id,result_json FROM analyses WHERE batch_id=? AND batch_revision=? AND input_sha256=?",
-                (batch["batch_id"], job["batch_revision"], input_digest),
+                (current_batch["batch_id"], current["batch_revision"], input_digest),
             ).fetchone()
             if existing is None:
                 cursor = self.connection.execute(
-                    "INSERT INTO analyses(batch_id,batch_revision,protocol_sha256,input_sha256,algorithm_version,seed," 
+                    "INSERT INTO analyses(batch_id,batch_revision,protocol_sha256,input_sha256,algorithm_version,seed,"
                     "result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                     (
-                        batch["batch_id"], job["batch_revision"], protocol_digest, input_digest,
+                        current_batch["batch_id"], current["batch_revision"], protocol_digest, input_digest,
                         ALGORITHM_VERSION, protocol.seed, canonical_json(result), statistician_id, self._now(),
                     ),
                 )
@@ -449,35 +577,108 @@ class TrialService:
             else:
                 analysis_id = existing["analysis_id"]
                 result = json.loads(existing["result_json"])
-            self.connection.execute(
-                "UPDATE analysis_jobs SET state='succeeded',lease_owner=NULL,lease_expires_at=NULL,updated_at=? "
-                "WHERE job_id=? AND state='leased' AND lease_owner=?",
-                (self._now(), job_id, worker_id),
+            response["analysis_id"] = analysis_id
+            response["result"] = result
+            cursor = self.connection.execute(
+                "UPDATE analysis_jobs SET state='succeeded',completed_by=?,completed_generation=?,"
+                "completed_analysis_id=?,completion_json=?,updated_at=? "
+                "WHERE job_id=? AND state='leased' AND lease_owner=? AND lease_generation=? "
+                "AND lease_expires_at>? AND batch_revision=? AND claim_input_sha256=?",
+                (
+                    worker_id, lease_generation, analysis_id, canonical_json(response), self._now(),
+                    job_id, worker_id, lease_generation, self._now(),
+                    current_batch["revision"], input_digest,
+                ),
             )
+            if cursor.rowcount != 1:
+                raise LeaseConflict(
+                    "租约栅栏在提交边界拒绝了过期的写入", {"job_id": job_id, "state": "leased"}
+                )
             self.connection.execute(
                 "UPDATE batches SET state='analyzed' WHERE batch_id=? AND state IN ('sealed','analyzing')",
-                (batch["batch_id"],),
+                (current_batch["batch_id"],),
+            )
+            self._audit(
+                "analysis_job",
+                str(job_id),
+                "analysis_job.completed",
+                worker_id,
+                {
+                    "job_id": job_id,
+                    "batch_id": current_batch["batch_id"],
+                    "worker_id": worker_id,
+                    "lease_generation": lease_generation,
+                    "analysis_id": analysis_id,
+                    "input_sha256": input_digest,
+                },
             )
             self._audit(
                 "batch",
-                batch["batch_id"],
+                current_batch["batch_id"],
                 "analysis.completed",
                 statistician_id,
                 {"analysis_id": analysis_id, "input_sha256": input_digest},
             )
-        return {"analysis_id": analysis_id, "input_sha256": input_digest, "result": result}
+        return response
 
-    def fail_job(self, worker_id: str, job_id: int, error: str, retry_seconds: int = 0) -> dict[str, Any]:
+    def fail_job(
+        self, worker_id: str, job_id: int, lease_generation: int, error: str, retry_seconds: int = 0
+    ) -> dict[str, Any]:
+        if retry_seconds < 0:
+            raise ValidationFailed("重试延迟不能为负数")
         available = isoformat(self.clock.now() + timedelta(seconds=retry_seconds))
         with transaction(self.connection, immediate=True):
+            job = self._get_job(job_id)
+            violation = self._fence_violation(
+                job, self.get_batch(job["batch_id"]), worker_id, lease_generation, self._now()
+            )
+            if violation is not None:
+                raise LeaseConflict(violation, {"job_id": job_id, "state": job["state"]})
             cursor = self.connection.execute(
-                "UPDATE analysis_jobs SET state='queued',available_at=?,lease_owner=NULL,lease_expires_at=NULL," 
-                "last_error=?,updated_at=? WHERE job_id=? AND state='leased' AND lease_owner=?",
-                (available, error[:1000], self._now(), job_id, worker_id),
+                "UPDATE analysis_jobs SET state='queued',available_at=?,lease_owner=NULL,lease_expires_at=NULL,"
+                "last_error=?,updated_at=? "
+                "WHERE job_id=? AND state='leased' AND lease_owner=? AND lease_generation=? AND lease_expires_at>?",
+                (available, error[:1000], self._now(), job_id, worker_id, lease_generation, self._now()),
             )
             if cursor.rowcount != 1:
-                raise InvalidState("任务未由当前工作进程持有")
-        return {"job_id": job_id, "state": "queued", "available_at": available}
+                raise LeaseConflict(
+                    "租约栅栏在提交边界拒绝了过期的失败上报", {"job_id": job_id, "state": "leased"}
+                )
+            self._audit(
+                "analysis_job",
+                str(job_id),
+                "analysis_job.failed",
+                worker_id,
+                {
+                    "job_id": job_id,
+                    "batch_id": job["batch_id"],
+                    "worker_id": worker_id,
+                    "lease_generation": lease_generation,
+                    "error": error[:1000],
+                    "available_at": available,
+                },
+            )
+        return {
+            "job_id": job_id,
+            "state": "queued",
+            "available_at": available,
+            "lease_generation": lease_generation,
+        }
+
+    def _job_events(self, job_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT event_id,event_type,actor_id,payload_json,created_at FROM audit_events "
+            "WHERE entity_type='analysis_job' AND entity_id=? ORDER BY event_id",
+            (str(job_id),),
+        ).fetchall()
+        return [dict(row) | {"payload": json.loads(row["payload_json"])} for row in rows]
+
+    def job_history(self, actor_id: str, job_id: int) -> dict[str, Any]:
+        """运维查询：呈现任务的各次领取、接管、失败与落库摘要。"""
+
+        self._require(actor_id, "audit.read")
+        job = self._get_job(job_id)
+        return {"job": dict(job), "events": self._job_events(job_id)}
 
     def decide(
         self, actor_id: str, batch_id: str, analysis_id: int, decision: str, reason: str
@@ -538,6 +739,9 @@ class TrialService:
             "WHERE entity_type='batch' AND entity_id=? "
             "ORDER BY event_id", (batch_id,)
         ).fetchall()
+        jobs = self.connection.execute(
+            "SELECT * FROM analysis_jobs WHERE batch_id=? ORDER BY job_id", (batch_id,)
+        ).fetchall()
         return {
             "batch": batch,
             "protocol": {
@@ -556,5 +760,8 @@ class TrialService:
             },
             "decision": None if decision_row is None else dict(decision_row),
             "exclusions": [dict(row) for row in exclusions],
+            "jobs": [
+                dict(job) | {"events": self._job_events(job["job_id"])} for job in jobs
+            ],
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
         }

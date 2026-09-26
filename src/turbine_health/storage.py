@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -116,7 +116,13 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT,
+    lease_generation INTEGER NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
     lease_expires_at TEXT,
+    claim_input_sha256 TEXT,
+    completed_by TEXT,
+    completed_generation INTEGER,
+    completed_analysis_id INTEGER REFERENCES analyses(analysis_id),
+    completion_json TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -190,11 +196,42 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """把旧版本数据库结构补齐到当前版本。"""
+
+    required = {
+        "lease_generation": "INTEGER NOT NULL DEFAULT 0",
+        "claim_input_sha256": "TEXT",
+        "completed_by": "TEXT",
+        "completed_generation": "INTEGER",
+        "completed_analysis_id": "INTEGER",
+        "completion_json": "TEXT",
+    }
+    existing = _column_names(connection, "analysis_jobs")
+    for name, declaration in required.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE analysis_jobs ADD COLUMN {name} {declaration}")
+    # 已经完成的历史任务，其最终结果只可能属于当前持有者对应的代次。
+    connection.execute(
+        "UPDATE analysis_jobs SET completed_generation=lease_generation "
+        "WHERE state='succeeded' AND completed_generation IS NULL"
+    )
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
     with transaction(connection, immediate=True):
+        row = connection.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()
+        if row is None or int(row["value"]) < SCHEMA_VERSION:
+            _migrate(connection)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

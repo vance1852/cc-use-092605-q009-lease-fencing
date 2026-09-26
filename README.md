@@ -47,3 +47,11 @@ PYTHONPATH=src python3 -m grid_qualification.api --database grid.sqlite3 --host 
 ```
 
 服务均提供 `GET /health`，其余接口使用 JSON。账号登录和角色权限由服务端校验，进程重启后可以继续查询 SQLite 中的业务状态与审计历史。
+
+## 分析任务租约栅栏
+
+`turbine_health` 的分析队列在提交边界核对五道栅栏：当前领取者、租约代次、有效期限、任务修订号和测点输入摘要。工作进程通过 `POST /jobs/claim` 领取任务（响应含 `lease_generation`、`attempts` 与领取时的 `input_sha256`），提交时必须回传该代次：
+
+- `POST /jobs/{id}/complete`：请求体携带 `worker_id` 与 `lease_generation`。任何一项栅栏落后都返回 `409 lease_conflict`，且不产生分析记录、状态变更或审计事件；同一持有者对同一代租约重复提交相同结果会取回原响应。
+- `POST /jobs/{id}/fail`：请求体携带 `worker_id`、`lease_generation`、`error`，栅栏与完成一致，迟到上报不会覆盖新持有者的状态。
+- `GET /jobs/{id}/history`：审计角色查询各次领取、接管、失败与最终落库使用的测点输入摘要；批次报告 `GET /batches/{id}/report` 同样包含每个任务的生命周期事件。

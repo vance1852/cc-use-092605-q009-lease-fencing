@@ -119,14 +119,18 @@ class JsonApplication:
                 return Response(200, {"job": result})
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
                 result = self.service.complete_job(
-                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
+                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers),
+                    int(payload["lease_generation"]),
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "fail":
                 result = self.service.fail_job(
-                    payload["worker_id"], int(parts[1]), payload["error"], int(payload.get("retry_seconds", 0))
+                    payload["worker_id"], int(parts[1]), int(payload["lease_generation"]),
+                    payload["error"], int(payload.get("retry_seconds", 0)),
                 )
                 return Response(200, result)
+            if method == "GET" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "history":
+                return Response(200, self.service.job_history(self._actor(normalized_headers), int(parts[1])))
             if method == "POST" and path == "/decisions":
                 result = self.service.decide(
                     self._actor(normalized_headers), payload["batch_id"], int(payload["analysis_id"]),
@@ -135,7 +139,11 @@ class JsonApplication:
                 return Response(201, result)
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
-            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+            body: dict[str, Any] = {"error": {"code": exc.code, "message": str(exc)}}
+            details = getattr(exc, "details", None)
+            if details:
+                body["error"]["details"] = details
+            return Response(exc.status, body)
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 

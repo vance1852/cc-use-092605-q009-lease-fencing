@@ -16,6 +16,17 @@ class Conflict(ServiceError):
     status = 409
 
 
+class LeaseConflict(Conflict):
+    """租约栅栏在提交边界拒绝了过期的写入。"""
+
+    code = "lease_conflict"
+    status = 409
+
+    def __init__(self, message: str, details: dict | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
+
+
 class Forbidden(ServiceError):
     code = "forbidden"
     status = 403
